@@ -1,6 +1,6 @@
 # 33 AI cTrader Bot
 
-An AI-enhanced algorithmic trading system combining Oliver Kell momentum breakout strategy with machine learning probability filtering.
+An AI-enhanced algorithmic trading system combining momentum breakout strategy with machine learning probability filtering.
 
 ## Overview
 

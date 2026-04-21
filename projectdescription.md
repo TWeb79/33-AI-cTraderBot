@@ -4,7 +4,7 @@
 
 This project is an advanced algorithmic trading system that combines:
 
-- Rule-based technical trading (Oliver Kell strategy)
+- Rule-based technical trading
 - Machine learning probability modeling
 - Reinforcement learning for parameter optimization
 - Optional local AI (LLM) integration for market regime analysis

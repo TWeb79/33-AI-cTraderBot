@@ -1,16 +1,16 @@
-Here is your **merged, production-ready strategy specification** as a single coherent **strategy.md** document suitable for a repo, whitepaper, or quant system documentation. I unified duplicated sections, aligned terminology, integrated AI logic into the classical Oliver Kell structure, and upgraded it into a **hybrid deterministic + probabilistic execution model**.
+Here is your **merged, production-ready strategy specification** as a single coherent **strategy.md** document suitable for a repo, whitepaper, or quant system documentation. I unified duplicated sections, aligned terminology, integrated AI logic into the classical structure, and upgraded it into a **hybrid deterministic + probabilistic execution model**.
 
 ---
 
 # 📄 `strategy.md`
 
-# Oliver Kell AI Momentum Breakout Strategy
+# AI Momentum Breakout Strategy
 
 ## Strategy Overview
 
-The **Oliver Kell AI Momentum Breakout Strategy** is a hybrid trading system combining:
+The ** AI Momentum Breakout Strategy** is a hybrid trading system combining:
 
-* classical Oliver Kell momentum breakout structure
+* classical momentum breakout structure
 * EMA trend alignment
 * volatility-aware exits
 * volume-validated continuation entries
