@@ -1,0 +1,7 @@
+[ctrader]
+# Fill in your cTrader Open API credentials here and save as `config.ini`
+# Do NOT commit `config.ini` — it's ignored by .gitignore.
+CLIENT_ID = YOUR_CLIENT_ID
+CLIENT_SECRET = YOUR_CLIENT_SECRET
+ACCESS_TOKEN = YOUR_ACCESS_TOKEN
+ACCOUNT_ID = 123456
