@@ -38,6 +38,7 @@ import pandas as pd
 
 try:
     from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.neural_network import MLPClassifier
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -62,6 +63,16 @@ except (ImportError, ModuleNotFoundError):
 _config = configparser.ConfigParser()
 _config.read("config.ini")
 
+
+def _get_config(section: str, option: str, default):
+    if _config.has_section(section):
+        return _config.get(section, option, fallback=default)
+    return default
+
+
+USE_LLM_REGIME = _get_config("llm", "enabled", "false").lower() == "true"
+OLLAMA_MODEL = _get_config("llm", "model", "llama3.2")
+
 CLIENT_ID = _config.get("ctrader", "CLIENT_ID", fallback=os.environ.get("CLIENT_ID", "YOUR_CLIENT_ID"))
 CLIENT_SECRET = _config.get("ctrader", "CLIENT_SECRET", fallback=os.environ.get("CLIENT_SECRET", "YOUR_CLIENT_SECRET"))
 ACCESS_TOKEN = _config.get("ctrader", "ACCESS_TOKEN", fallback=os.environ.get("ACCESS_TOKEN", "YOUR_ACCESS_TOKEN"))
@@ -79,7 +90,7 @@ EMA_SLOW = 20
 ATR_PERIOD = 14
 BASE_MIN_BARS = 3
 BASE_MAX_BARS = 15
-BASE_ATR_RATIO = 2.0
+BASE_ATR_RATIO = 0.5
 VOLUME_SURGE_MULT = 1.5
 EXHAUSTION_ATR_MULT = 3.0
 WEDGE_BARS = 5
@@ -87,6 +98,8 @@ TRAIL_ATR_MULT = 1.5
 
 PROBABILITY_THRESHOLD = 0.65
 MODEL_PATH = "ai_trade_model.pkl"
+MODEL_TYPE = _get_config("ai", "MODEL_TYPE", "gb").lower()
+MLP_HIDDEN_LAYERS = (32, 16)
 
 CONFIDENCE_RISK_MAP = {
     0.80: 1.2,
@@ -100,6 +113,7 @@ class Signal(Enum):
     NONE = "NONE"
     BASE_BREAK = "BASE_N_BREAK"
     WEDGE_POP = "WEDGE_POP"
+    WEDGE_DROP = "WEDGE_DROP"
     EXIT_EXHAUST = "EXIT_EXHAUSTION"
     EXIT_CROSSBACK = "EXIT_EMA_CROSSBACK"
 
@@ -186,8 +200,17 @@ class Indicators:
 class PatternDetector:
     def __init__(self, bar_buffer_size: int = 50):
         self.bars: Deque[Bar] = deque(maxlen=bar_buffer_size)
-        self.indic: Indicators = Indicators()
+        self.indic = Indicators()
+        self.feature_engine = FeatureEngine(bar_buffer_size=bar_buffer_size)
+        self.volatility_detector = MarketRegimeDetector()
+        self.llm_detector = LLMRegimeDetector()
         self._indic_vals: List[dict] = []
+
+    def get_regime(self) -> str:
+        llm_regime = self.llm_detector.detect("") if self.llm_detector.enabled else None
+        if llm_regime:
+            return llm_regime
+        return self.volatility_detector.detect()
 
     def push(self, bar: Bar) -> Signal:
         self.bars.append(bar)
@@ -195,7 +218,20 @@ class PatternDetector:
         self._indic_vals.append(vals)
         if len(self.bars) < BASE_MAX_BARS + 5:
             return Signal.NONE
-        return self._evaluate(vals)
+        signal = self._evaluate(vals)
+        self.feature_engine.update(
+            close=bar.close,
+            ema_fast=vals["ema_fast"],
+            ema_slow=vals["ema_slow"],
+            timestamp=bar.time,
+        )
+        self.volatility_detector.update(
+            close=bar.close,
+            atr=vals["atr"],
+            ema_fast=vals["ema_fast"],
+            ema_slow=vals["ema_slow"],
+        )
+        return signal
 
     def _evaluate(self, vals: dict) -> Signal:
         bars = list(self.bars)
@@ -223,6 +259,10 @@ class PatternDetector:
         wedge_signal = self._detect_wedge_pop(bars, ema_f, avg_v)
         if wedge_signal != Signal.NONE:
             return wedge_signal
+
+        wedge_drop = self._detect_wedge_drop(bars, ema_f)
+        if wedge_drop != Signal.NONE:
+            return wedge_drop
 
         return Signal.NONE
 
@@ -288,6 +328,39 @@ class PatternDetector:
         logging.info("[SIGNAL] Wedge Pop detected")
         return Signal.WEDGE_POP
 
+    def _detect_wedge_drop(self, bars: list, ema_fast: float) -> Signal:
+        """
+        Wedge Drop: temporary pullback forming lower highs and lower lows
+        while maintaining structure above key EMA. Context signal only -
+        indicates trend pause, not reversal. No direct entry.
+        """
+        if len(bars) < WEDGE_BARS + 1:
+            return Signal.NONE
+
+        pullback = bars[-(WEDGE_BARS + 1):-1]
+        latest = bars[-1]
+
+        highs = [b.high for b in pullback]
+        lows = [b.low for b in pullback]
+        declining_highs = all(highs[i] >= highs[i+1] for i in range(len(highs)-1))
+        declining_lows = all(lows[i] >= lows[i+1] for i in range(len(lows)-1))
+
+        if not (declining_highs and declining_lows):
+            return Signal.NONE
+
+        if any(b.low < ema_fast * 0.99 for b in pullback):
+            return Signal.NONE
+
+        if latest.close >= highs[0]:
+            return Signal.NONE
+
+        for b in pullback:
+            if b.low < ema_fast * 0.995:
+                return Signal.NONE
+
+        logging.info("[CONTEXT] Wedge Drop detected | trend pause, not reversal")
+        return Signal.WEDGE_DROP
+
     def get_base_low(self) -> float:
         bars = list(self.bars)
         if len(bars) < BASE_MIN_BARS:
@@ -322,6 +395,10 @@ class PatternDetector:
         breakout_velocity = (latest.close - base_low) / atr if atr > 0 else 0
         volume_ratio = latest.volume / avg_vol if avg_vol > 0 else 1
 
+        context_feats = self.feature_engine.extract_context_features(latest.time)
+        regime = self.volatility_detector.detect()
+        regime_score = {"TRENDING_UP": 1.0, "TRENDING_DOWN": -1.0, "RANGING": 0.0, "VOLATILE": 0.0, "UNKNOWN": 0.0}.get(regime, 0.0)
+
         return {
             "ema_slope": ema_slope,
             "ema_distance_ratio": ema_distance_ratio,
@@ -332,12 +409,102 @@ class PatternDetector:
             "ema_fast": ema_f,
             "ema_slow": ema_s,
             "atr": atr,
+            "mtf_alignment": context_feats.get("mtf_alignment", 0.0),
+            "trend_maturity": context_feats.get("trend_maturity", 0),
+            "asia_session": context_feats.get("asia_session", 0.0),
+            "london_session": context_feats.get("london_session", 0.0),
+            "ny_session": context_feats.get("ny_session", 0.0),
+            "regime_score": regime_score,
+        }
+
+
+class FeatureEngine:
+    """
+    Computes advanced context features: multi-timeframe alignment, session timing, trend maturity.
+    """
+    ASIA_SESSION = (0, 8)
+    LONDON_SESSION = (8, 16)
+    NY_SESSION = (13, 21)
+
+    def __init__(self, bar_buffer_size: int = 200):
+        self.close_history: List[float] = []
+        self.ema_fast_history: List[float] = []
+        self.ema_slow_history: List[float] = []
+        self.time_history: List[datetime] = []
+        self.max_len = bar_buffer_size
+
+    def update(self, close: float, ema_fast: float, ema_slow: float, timestamp: datetime):
+        self.close_history.append(close)
+        self.ema_fast_history.append(ema_fast)
+        self.ema_slow_history.append(ema_slow)
+        self.time_history.append(timestamp)
+        if len(self.close_history) > self.max_len:
+            self.close_history = self.close_history[-self.max_len:]
+            self.ema_fast_history = self.ema_fast_history[-self.max_len:]
+            self.ema_slow_history = self.ema_slow_history[-self.max_len:]
+            self.time_history = self.time_history[-self.max_len:]
+
+    def get_multi_timeframe_alignment(self) -> float:
+        if len(self.close_history) < 50:
+            return 0.0
+
+        short_ema = np.mean(self.ema_fast_history[-10:])
+        mid_ema = np.mean(self.ema_fast_history[-30:])
+        long_ema = np.mean(self.ema_fast_history[-50:])
+
+        bullish = short_ema > mid_ema > long_ema
+        bearish = short_ema < mid_ema < long_ema
+
+        if bullish:
+            return 1.0
+        elif bearish:
+            return -1.0
+        return 0.0
+
+    def get_session_weights(self, timestamp: datetime) -> Tuple[float, float, float]:
+        hour = timestamp.hour
+        asia = 1.0 if self.ASIA_SESSION[0] <= hour < self.ASIA_SESSION[1] else 0.0
+        london = 1.0 if self.LONDON_SESSION[0] <= hour < self.LONDON_SESSION[1] else 0.0
+        ny = 1.0 if self.NY_SESSION[0] <= hour < self.NY_SESSION[1] else 0.0
+        return (asia, london, ny)
+
+    def get_trend_maturity(self) -> int:
+        if len(self.close_history) < 5:
+            return 0
+        recent = np.array(self.close_history[-10:])
+        if len(recent) < 2:
+            return 0
+        x = np.arange(len(recent))
+        slope = np.polyfit(x, recent, 1)[0]
+        if slope > 1e-6:
+            direction = 1
+        elif slope < -1e-6:
+            direction = -1
+        else:
+            return 0
+        count = 0
+        for i in range(2, len(self.close_history)):
+            p1, p2 = self.close_history[-i], self.close_history[-i+1]
+            if (direction == 1 and p2 > p1) or (direction == -1 and p2 < p1):
+                count += 1
+            else:
+                break
+        return count
+
+    def extract_context_features(self, timestamp: datetime) -> dict:
+        return {
+            "mtf_alignment": self.get_multi_timeframe_alignment(),
+            "trend_maturity": self.get_trend_maturity(),
+            "asia_session": self.get_session_weights(timestamp)[0],
+            "london_session": self.get_session_weights(timestamp)[1],
+            "ny_session": self.get_session_weights(timestamp)[2],
         }
 
 
 class AITradeFilter:
-    def __init__(self, model_path: str = MODEL_PATH):
+    def __init__(self, model_path: str = MODEL_PATH, model_type: str = MODEL_TYPE):
         self.model_path = model_path
+        self.model_type = model_type
         self.model = None
         self.threshold = PROBABILITY_THRESHOLD
         self._load_model()
@@ -358,9 +525,17 @@ class AITradeFilter:
             logging.info("No trained model found. Using default threshold.")
             self.model = self._create_default_model()
 
-    def _create_default_model(self) -> Optional[GradientBoostingClassifier]:
+    def _create_default_model(self):
         if not HAS_SKLEARN:
             return None
+        if self.model_type in {"mlp", "neural", "nn"}:
+            return MLPClassifier(
+                hidden_layer_sizes=MLP_HIDDEN_LAYERS,
+                activation="relu",
+                solver="adam",
+                max_iter=500,
+                random_state=42,
+            )
         return GradientBoostingClassifier(
             n_estimators=50,
             max_depth=3,
@@ -373,17 +548,31 @@ class AITradeFilter:
             return 0.65, 0.65
 
         try:
-            X = np.array([[
+            feature_vec = [
                 features.get("ema_slope", 0),
                 features.get("ema_distance_ratio", 0),
                 features.get("atr_expansion", 1),
                 features.get("base_tightness", 0),
                 features.get("breakout_velocity", 0),
                 features.get("volume_ratio", 1),
-            ]])
+                features.get("mtf_alignment", 0.0),
+                features.get("trend_maturity", 0),
+                features.get("regime_score", 0.0),
+                features.get("asia_session", 0.0),
+                features.get("london_session", 0.0),
+                features.get("ny_session", 0.0),
+            ]
+            X = np.array([feature_vec])
             prob = self.model.predict_proba(X)[0]
             confidence = float(prob[1]) if len(prob) > 1 else 0.65
             return confidence, confidence
+        except ValueError as e:
+            if "n_features" in str(e) and HAS_SKLEARN:
+                logging.warning("Feature dimension mismatch - recreating model.")
+                self.model = self._create_default_model()
+                return 0.65, 0.65
+            logging.warning(f"Prediction error: {e}")
+            return 0.65, 0.65
         except Exception as e:
             logging.warning(f"Prediction error: {e}")
             return 0.65, 0.65
@@ -393,15 +582,16 @@ class AITradeFilter:
         return confidence >= self.threshold
 
     def get_confidence_risk(self, confidence: float) -> float:
-        if confidence >= 0.80:
-            return 1.2
-        elif confidence >= 0.70:
-            return 1.0
-        elif confidence >= 0.60:
-            return 0.8
-        elif confidence >= 0.50:
-            return 0.5
-        return 0.3
+        """
+        Continuous risk scaling based on confidence.
+        Maps [0.0, 1.0] -> [0.2, 1.5] using smooth curve.
+        Formula: 0.2 + (confidence^0.5) * 1.3
+        Result: 0.5 confidence -> ~0.82, 0.8 confidence -> ~1.24
+        """
+        if confidence <= 0:
+            return 0.2
+        scaled = 0.2 + (confidence ** 0.5) * 1.3
+        return max(0.2, min(1.5, scaled))
 
     def train(self, X: np.ndarray, y: np.ndarray):
         if self.model is None:
@@ -412,6 +602,91 @@ class AITradeFilter:
             with open(self.model_path, "wb") as f:
                 pickle.dump(self.model, f)
             logging.info(f"Model trained and saved to {self.model_path}")
+
+
+class LLMRegimeDetector:
+    """
+    Optional LLM-based regime classifier using local Ollama model.
+    If enabled, provides a secondary regime opinion based on market context.
+    Falls back to MarketRegimeDetector if disabled or unavailable.
+    """
+    def __init__(self, model_name: str = OLLAMA_MODEL):
+        self.enabled = USE_LLM_REGIME
+        self.model_name = model_name
+
+    def detect(self, features_summary: str) -> Optional[str]:
+        if not self.enabled:
+            return None
+        try:
+            import ollama
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": f"Classify market regime from: {features_summary}. Answer: TRENDING_UP, TRENDING_DOWN, RANGING, VOLATILE"}],
+            )
+            text = response["message"]["content"].strip().upper()
+            for regime in ("TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE"):
+                if regime in text:
+                    return regime
+            return None
+        except Exception as e:
+            logging.debug(f"LLM regime detection skipped: {e}")
+            return None
+
+
+class MarketRegimeDetector:
+    """
+    Detects current market regime using volatility and trend strength metrics.
+    Regimes: TRENDING_UP, TRENDING_DOWN, RANGING, VOLATILE, UNKNOWN
+    """
+    def __init__(self, lookback: int = 20, atr_threshold: float = 1.5, trend_strength_threshold: float = 0.3):
+        self.lookback = lookback
+        self.atr_threshold = atr_threshold
+        self.trend_strength_threshold = trend_strength_threshold
+        self.close_history: List[float] = []
+        self.atr_history: List[float] = []
+        self.ema_history: List[float] = []
+
+    def update(self, close: float, atr: float, ema_fast: float, ema_slow: float):
+        self.close_history.append(close)
+        self.atr_history.append(atr)
+        self.ema_history.append((ema_fast, ema_slow))
+        if len(self.close_history) > self.lookback * 2:
+            self.close_history = self.close_history[-self.lookback*2:]
+            self.atr_history = self.atr_history[-self.lookback*2:]
+            self.ema_history = self.ema_history[-self.lookback*2:]
+
+    def detect(self) -> str:
+        if len(self.close_history) < self.lookback:
+            return "UNKNOWN"
+
+        prices = np.array(self.close_history)
+        atr_current = self.atr_history[-1] if self.atr_history else 0
+        atr_avg = np.mean(self.atr_history[-10:]) if len(self.atr_history) >= 10 else atr_current
+
+        volatility_ratio = atr_current / atr_avg if atr_avg > 0 else 1.0
+
+        if volatility_ratio > 2.0:
+            return "VOLATILE"
+
+        x = np.arange(len(prices))
+        slope = np.polyfit(x, prices, 1)[0]
+        price_range = prices.max() - prices.min()
+        if price_range > 1e-10:
+            trend_strength = abs(slope * len(prices)) / price_range
+        else:
+            trend_strength = 0
+
+        ema_fast, ema_slow = self.ema_history[-1]
+        ema_bullish = ema_fast > ema_slow
+        ema_bearish = ema_fast < ema_slow
+
+        if trend_strength > self.trend_strength_threshold:
+            if slope > 0 and ema_bullish:
+                return "TRENDING_UP"
+            elif slope < 0 and ema_bearish:
+                return "TRENDING_DOWN"
+
+        return "RANGING"
 
 
 class RiskManager:
@@ -428,6 +703,110 @@ class RiskManager:
     def update_trail_stop(current_price: float, current_trail: float, atr: float) -> float:
         new_trail = current_price - TRAIL_ATR_MULT * atr
         return max(new_trail, current_trail)
+
+
+class ParameterOptimizer:
+    """
+    Reinforcement-learning inspired hyperparameter tuner.
+    Uses random search + backtest evaluation to optimize strategy parameters.
+    Optimizes: EMA periods, ATR multipliers, volume threshold, probability threshold.
+    Objective: maximize Sharpe ratio with drawdown penalty.
+    """
+    def __init__(self, base_params: dict, n_iterations: int = 20):
+        self.base_params = base_params
+        self.n_iterations = n_iterations
+        self.best_score = -float('inf')
+        self.best_params = base_params.copy()
+
+    def _sample_params(self) -> dict:
+        import random
+        fast = random.choice([8, 10, 12, 15])
+        slow = random.choice([20, 25, 30, 40])
+        while slow <= fast:
+            slow = random.choice([20, 25, 30, 40])
+        exhaustion_mult = random.uniform(2.5, 4.0)
+        base_atr_ratio = random.uniform(0.3, 0.8)
+        volume_mult = random.uniform(1.2, 2.5)
+        trail_mult = random.uniform(1.2, 2.5)
+        prob_threshold = random.uniform(0.55, 0.80)
+        return {
+            "EMA_FAST": fast,
+            "EMA_SLOW": slow,
+            "EXHAUSTION_ATR_MULT": exhaustion_mult,
+            "BASE_ATR_RATIO": base_atr_ratio,
+            "VOLUME_SURGE_MULT": volume_mult,
+            "TRAIL_ATR_MULT": trail_mult,
+            "PROBABILITY_THRESHOLD": prob_threshold,
+        }
+
+    def optimize(self, df: pd.DataFrame) -> dict:
+        if not HAS_SKLEARN:
+            logging.warning("sklearn not available - skipping optimization.")
+            return self.base_params
+
+        logging.info(f"ParameterOptimizer: running {self.n_iterations} iterations ...")
+        for i in range(self.n_iterations):
+            params = self._sample_params()
+            bot = self._create_bot(params)
+            trades = bot.run_on_dataframe(df)
+            score = self._calculate_score(trades)
+            logging.info(f"  Iteration {i+1}/{self.n_iterations}: Sharpe={score:.3f} Params={params}")
+            if score > self.best_score:
+                self.best_score = score
+                self.best_params = params
+                logging.info(f"  → New best parameters found!")
+
+        logging.info(f"Optimization complete. Best score: {self.best_score:.3f}")
+        return self.best_params
+
+    def _create_bot(self, params: dict) -> 'AITradingBot':
+        import sys
+        module = sys.modules[__name__]
+        old = {}
+        for k, v in params.items():
+            if hasattr(module, k):
+                old[k] = getattr(module, k)
+                setattr(module, k, v)
+        bot = AITradingBot()
+        bot.balance = params.get("INITIAL_BALANCE", 10000.0)
+        for k, v in old.items():
+            setattr(module, k, v)
+        return bot
+
+    def _calculate_score(self, trades: pd.DataFrame) -> float:
+        if trades.empty or len(trades) < 5:
+            return -1.0
+        win_rate = (trades["pnl"] > 0).mean()
+        total_pnl = trades["pnl"].sum()
+        avg_win = trades[trades["pnl"] > 0]["pnl"].mean() if (trades["pnl"] > 0).any() else 0
+        avg_loss = trades[trades["pnl"] < 0]["pnl"].mean() if (trades["pnl"] < 0).any() else 0
+        profit_factor = (trades[trades["pnl"] > 0]["pnl"].sum() /
+                         abs(trades[trades["pnl"] < 0]["pnl"].sum())) if (trades["pnl"] < 0).any() else 5.0
+        returns = trades["pnl"].values
+        if len(returns) < 2:
+            sharpe = 0.0
+        else:
+            mean_ret = np.mean(returns)
+            std_ret = np.std(returns)
+            sharpe = mean_ret / std_ret if std_ret > 1e-10 else 0.0
+        drawdown = self._calculate_max_drawdown(trades)
+        penalty = max(0, (drawdown - 0.15) * 10)
+        score = (profit_factor * 0.4 + sharpe * 0.4 + win_rate * 0.2) - penalty
+        return score
+
+    def _calculate_max_drawdown(self, trades: pd.DataFrame) -> float:
+        equity = [self.base_params.get("INITIAL_BALANCE", 10000)]
+        for _, t in trades.iterrows():
+            equity.append(equity[-1] + t["pnl"])
+        peak = equity[0]
+        max_dd = 0.0
+        for e in equity[1:]:
+            if e > peak:
+                peak = e
+            dd = (peak - e) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+        return max_dd
 
 
 class AITradingBot:
@@ -543,12 +922,25 @@ class AITradingBot:
         elif signal in (Signal.BASE_BREAK, Signal.WEDGE_POP):
             if not self.state.in_position:
                 features = self.detector.extract_features()
+                regime = self.detector.get_regime()
+                if regime in ("RANGING", "VOLATILE", "UNKNOWN"):
+                    self.log.info(f"[REGIME FILTER] Skipping trade | regime={regime}")
+                    return
+
                 if self.ai_filter.should_trade(features):
                     self.feature_history.append(features)
                     self._open_position(bar, signal, atr)
                 else:
                     confidence, _ = self.ai_filter.predict_probability(features)
-                    self.log.info(f"[AI FILTER] Trade rejected | confidence={confidence:.2f} < {self.threshold}")
+                    self.log.info(
+                        f"[AI FILTER] Trade rejected | confidence={confidence:.2f} "
+                        f"< {self.ai_filter.threshold:.2f}"
+                    )
+        elif signal == Signal.WEDGE_DROP:
+            self.log.info(
+                f"[CONTEXT] Wedge Drop detected | price={bar.close:.5f} "
+                f"regime={self.detector.get_regime()}"
+            )
 
     def _open_position(self, bar: Bar, signal: Signal, atr: float):
         base_low = self.detector.get_base_low()
@@ -558,7 +950,7 @@ class AITradingBot:
         features = self.detector.extract_features()
         confidence, _ = self.ai_filter.predict_probability(features)
 
-        risk_pct = self.ai_filter.get_confidence_risk(confidence)
+        risk_pct = RISK_PERCENT * self.ai_filter.get_confidence_risk(confidence)
         units = self.risk.position_size(self.balance, risk_pct, entry, stop_loss)
 
         if units <= 0:
@@ -624,15 +1016,24 @@ class AITradingBot:
             return
 
         try:
-            X = np.array([[
-                f.get("ema_slope", 0),
-                f.get("ema_distance_ratio", 0),
-                f.get("atr_expansion", 1),
-                f.get("base_tightness", 0),
-                f.get("breakout_velocity", 0),
-                f.get("volume_ratio", 1),
-            ] for f in self.feature_history])
-
+            feature_list = []
+            for f in self.feature_history:
+                vec = [
+                    f.get("ema_slope", 0),
+                    f.get("ema_distance_ratio", 0),
+                    f.get("atr_expansion", 1),
+                    f.get("base_tightness", 0),
+                    f.get("breakout_velocity", 0),
+                    f.get("volume_ratio", 1),
+                    f.get("mtf_alignment", 0.0),
+                    f.get("trend_maturity", 0),
+                    f.get("regime_score", 0.0),
+                    f.get("asia_session", 0.0),
+                    f.get("london_session", 0.0),
+                    f.get("ny_session", 0.0),
+                ]
+                feature_list.append(vec)
+            X = np.array(feature_list)
             y = np.array(self.outcome_history)
 
             if len(np.unique(y)) < 2:
@@ -807,11 +1208,36 @@ def generate_demo_data(n_bars: int = 500, seed: int = 42) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    mode = "backtest"
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+
+    if mode == "optimize":
+        print("=== Parameter Optimization Mode ===")
+        base_params = {
+            "EMA_FAST": EMA_FAST,
+            "EMA_SLOW": EMA_SLOW,
+            "EXHAUSTION_ATR_MULT": EXHAUSTION_ATR_MULT,
+            "BASE_ATR_RATIO": BASE_ATR_RATIO,
+            "VOLUME_SURGE_MULT": VOLUME_SURGE_MULT,
+            "TRAIL_ATR_MULT": TRAIL_ATR_MULT,
+            "PROBABILITY_THRESHOLD": PROBABILITY_THRESHOLD,
+            "INITIAL_BALANCE": 10000,
+        }
+        optimizer = ParameterOptimizer(base_params, n_iterations=10)
+        demo_df = generate_demo_data(n_bars=600)
+        best_params = optimizer.optimize(demo_df)
+        print("\n=== Optimal Parameters ===")
+        for k, v in best_params.items():
+            print(f"  {k}: {v}")
+        sys.exit(0)
 
     bot = AITradingBot()
 

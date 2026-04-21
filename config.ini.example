@@ -5,3 +5,12 @@ CLIENT_ID = YOUR_CLIENT_ID
 CLIENT_SECRET = YOUR_CLIENT_SECRET
 ACCESS_TOKEN = YOUR_ACCESS_TOKEN
 ACCOUNT_ID = 123456
+
+[ai]
+# Model type: gb (gradient boosting) or mlp (neural network)
+MODEL_TYPE = gb
+
+[llm]
+# Optional: enable LLM-based regime detection via Ollama
+enabled = false
+model = llama3.2
