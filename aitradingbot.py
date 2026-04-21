@@ -48,8 +48,14 @@ try:
     from ctrader_open_api.messages.OpenApiMessages_pb2 import *
     from twisted.internet import reactor, defer
     LIVE_MODE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     LIVE_MODE = False
+    Client = None
+    Protobuf = None
+    TcpProtocol = None
+    EndPoints = None
+    reactor = None
+    defer = None
     print("[WARNING] ctrader-open-api not installed. Running in SIMULATION mode.")
     print("          pip install ctrader-open-api twisted\n")
 
@@ -64,8 +70,8 @@ try:
 except ValueError:
     ACCOUNT_ID = 123456
 
-SYMBOL_NAME = "EURUSD"
-TIMEFRAME = "H1"
+SYMBOL_NAME = "US500"
+TIMEFRAME = "M5"
 RISK_PERCENT = 1.5
 
 EMA_FAST = 10
@@ -73,7 +79,7 @@ EMA_SLOW = 20
 ATR_PERIOD = 14
 BASE_MIN_BARS = 3
 BASE_MAX_BARS = 15
-BASE_ATR_RATIO = 0.5
+BASE_ATR_RATIO = 2.0
 VOLUME_SURGE_MULT = 1.5
 EXHAUSTION_ATR_MULT = 3.0
 WEDGE_BARS = 5
@@ -511,6 +517,12 @@ class AITradingBot:
         indic = self.detector.latest_indicators()
         atr = indic.get("atr", 0.0)
 
+        if len(self.detector.bars) > 20 and signal != Signal.NONE:
+            self.log.info(
+                f"[DEBUG] bar={bar.close:.5f} ema_f={indic.get('ema_fast',0):.5f} "
+                f"ema_s={indic.get('ema_slow',0):.5f} signal={signal.value}"
+            )
+
         if self.state.in_position and atr > 0:
             new_trail = self.risk.update_trail_stop(bar.close, self.state.trail_stop, atr)
             if new_trail != self.state.trail_stop:
@@ -721,23 +733,75 @@ def generate_demo_data(n_bars: int = 500, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2024-01-01", periods=n_bars, freq="1h")
 
-    returns = rng.normal(0.0002, 0.003, n_bars)
-    returns[50:100] += 0.001
-    returns[150:200] += 0.001
-    returns[250:350] += 0.0015
-    returns[400:450] += 0.001
+    close = np.zeros(n_bars)
+    high = np.zeros(n_bars)
+    low = np.zeros(n_bars)
+    volume = np.zeros(n_bars)
 
-    close = 1.1000 * np.exp(np.cumsum(returns))
-    vol = rng.uniform(800, 2500, n_bars)
-    vol[returns > 0.004] *= 2.5
+    current_price = 1.1000
+    
+    for i in range(50):
+        trend = (i / 50) * 0.0008
+        noise = rng.normal(trend, 0.00015)
+        current_price += noise
+        close[i] = current_price
+        high[i] = current_price + rng.uniform(0.00005, 0.0002)
+        low[i] = current_price - rng.uniform(0.00005, 0.0002)
+        volume[i] = rng.uniform(800, 1200)
+    
+    breakout_points = [80, 220, 380, 520]
+    
+    for bp in breakout_points:
+        if bp + 20 >= n_bars:
+            break
+        
+        base_start = bp
+        base_len = 5
+        base_low = current_price
+        base_high = current_price + rng.uniform(0.001, 0.0025)
+        
+        for j in range(base_len):
+            idx = base_start + j
+            if idx < n_bars:
+                close[idx] = rng.uniform(base_low, base_high)
+                high[idx] = base_high + rng.uniform(0, 0.00005)
+                low[idx] = base_low - rng.uniform(0, 0.00005)
+                volume[idx] = rng.uniform(850, 1150)
+        
+        breakout_idx = base_start + base_len
+        if breakout_idx < n_bars:
+            breakout_move = rng.uniform(0.004, 0.009)
+            current_price = base_high + breakout_move
+            close[breakout_idx] = current_price
+            high[breakout_idx] = current_price + rng.uniform(0.0001, 0.00035)
+            low[breakout_idx] = current_price - rng.uniform(0.0001, 0.00035)
+            volume[breakout_idx] = rng.uniform(2200, 3800)
+            
+            for k in range(1, 18):
+                if breakout_idx + k < n_bars:
+                    trend_move = rng.normal(0.00035, 0.00025)
+                    current_price += trend_move
+                    close[breakout_idx + k] = current_price
+                    high[breakout_idx + k] = current_price + rng.uniform(0.0001, 0.00035)
+                    low[breakout_idx + k] = current_price - rng.uniform(0.0001, 0.00035)
+                    volume[breakout_idx + k] = rng.uniform(1200, 2400)
+
+    for i in range(n_bars):
+        if close[i] == 0:
+            noise = rng.normal(0.0001, 0.0001)
+            current_price += noise
+            close[i] = current_price
+            high[i] = current_price + rng.uniform(0.00005, 0.0002)
+            low[i] = current_price - rng.uniform(0.00005, 0.0002)
+            volume[i] = rng.uniform(900, 1500)
 
     df = pd.DataFrame({
         "time": dates,
-        "open": close * rng.uniform(0.999, 1.001, n_bars),
-        "high": close * rng.uniform(1.001, 1.004, n_bars),
-        "low": close * rng.uniform(0.996, 0.999, n_bars),
+        "open": close,
+        "high": high,
+        "low": low,
         "close": close,
-        "volume": vol,
+        "volume": volume,
     })
     return df
 
