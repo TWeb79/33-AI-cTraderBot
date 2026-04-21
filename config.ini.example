@@ -11,6 +11,9 @@ ACCOUNT_ID = 123456
 MODEL_TYPE = gb
 
 [llm]
-# Optional: enable LLM-based regime detection via Ollama
+# Optional: enable LLM-based regime detection
 enabled = false
+backend = ollama  # "ollama" (default) or "lightllm" (faster, GPU recommended)
 model = llama3.2
+# Only used if backend=lightllm:
+lightllm_model_path = /path/to/lightllm/model

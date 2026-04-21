@@ -114,21 +114,25 @@ Enter breakout candle close.
 
 ---
 
-## 3. Wedge Drop (Pre-Continuation Compression)
+## 3. Wedge Drop (Context-Only Signal)
 
-Temporary pullback pattern.
+Temporary pullback forming lower highs and lower lows while maintaining structure above EMA 10.
 
-Signals:
+**Conditions:**
+
+* 5-bar compression with declining highs/lows
+* Price stays above EMA 10 (no close below)
+* No breakout — merely a pullback formation
+
+**Interpretation:**
 
 ```
 trend pause
-not reversal
-potential upcoming Base 'n Break
+≠ reversal
+potential upcoming Base 'n Break or Wedge Pop continuation
 ```
 
-No direct entry.
-
-Context signal only.
+**Action:** Context signal only. No direct entry. Logged for regime context and potential continuation setup anticipation.
 
 ---
 
@@ -292,63 +296,52 @@ Stop never moves downward.
 
 # AI Probability Filter
 
-Before executing any trade:
+Before executing any trade, the model computes `P(win | features_t)` using a Gradient Boosting or MLP classifier.
 
-Model computes:
-
-```
-P(win | features)
-```
-
-Trade executes only if:
+**Execution gate:**
 
 ```
-P(win) > threshold
+trade_allowed ⇔ P(win) > threshold
 ```
 
-Typical threshold:
+Default threshold: `0.65` (configurable).
 
-```
-0.60 – 0.70
-```
+**Rejection:** Trades with insufficient confidence are skipped entirely (no position opened).
 
-Example:
+**Model input:** 12-dimensional feature vector (market structure + context features).
 
-```
-P = 0.72 → trade allowed
-P = 0.54 → trade rejected
-```
+**Model output:** Probability score `[0–1]`.
 
-Purpose:
+**Purpose:** Reduce low-quality breakout entries; filter out low-edge regime conditions.
 
-Reduce low-quality breakout entries.
+**Retraining:** After every 10+ closed trades, the model is retrained incrementally on the latest outcome-labeled dataset (`_retrain_model`).
 
 ---
 
-# Confidence-Weighted Position Sizing
+# Confidence-Weighted Position Sizing (Continuous)
 
-Instead of fixed risk:
+Risk is a continuous function of model confidence, not discrete buckets.
 
-```
-risk = base_risk × confidence_score
-```
-
-Example:
-
-| Confidence | Risk |
-| ---------- | ---- |
-| 0.80       | 1.2% |
-| 0.60       | 0.8% |
-| 0.50       | 0.5% |
-
-Effect:
+**Formula:**
 
 ```
-strong signals = larger allocation
-weak signals = smaller allocation
+risk_multiplier = 0.2 + (confidence^0.5) × 1.3
+final_risk = base_risk × risk_multiplier
 ```
 
-Improves equity curve stability.
+Clamped to range `[0.2, 1.5]`.
+
+**Scaling behavior:**
+
+| Confidence | Risk Multiplier |
+| ---------- | --------------- |
+| 0.50       | ~0.82          |
+| 0.60       | ~0.95          |
+| 0.70       | ~1.08          |
+| 0.80       | ~1.24          |
+| 0.90       | ~1.44          |
+
+**Effect:** Stronger AI confidence → larger allocation; weak signals are minimized but not eliminated. Implemented in `AITradeFilter.get_confidence_risk()`.
 
 ---
 
@@ -374,63 +367,65 @@ Position size = 50 units
 
 ---
 
-# Feature Set for AI Model
+# Feature Set for AI Model (12 features)
 
-## Market Structure Features
+Features are extracted per bar at signal time and fed to the ML classifier.
 
-```
-EMA slope
-EMA distance ratio
-ATR expansion ratio
-volatility compression score
-trend strength index
-```
+## Market Structure Features (5)
 
----
+| Feature | Formula | Purpose |
+| ------- | --------| ------- |
+| `ema_slope` | `(ema_fast_t − ema_fast_{t−5}) / 5` | Short-term trend momentum |
+| `ema_distance_ratio` | `(close − ema_slow) / atr` | Normalized distance from slow EMA |
+| `atr_expansion` | `atr_t / mean(atr_{t−10:t})` | Volatility regime expansion |
+| `base_tightness` | `(base_high − base_low) / atr` | Consolidation tightness (lower = tighter) |
+| `breakout_velocity` | `(close − base_low) / atr` | Breakout strength normalized |
 
-## Signal Features
+## Context Features (6)
 
-```
-base width
-base tightness
-breakout velocity
-volume expansion ratio
-pattern classification
-```
+| Feature | Type | Purpose |
+| ------- | ---- | ------- |
+| `mtf_alignment` | float ∈ {−1,0,1} | Multi-timeframe trend alignment: short/mid/long EMA stack |
+| `trend_maturity` | int ≥ 0 | Number of consecutive trend bars reinforcing current direction |
+| `asia_session` | 0/1 | Hour ∈ [0,8) |
+| `london_session` | 0/1 | Hour ∈ [8,16) |
+| `ny_session` | 0/1 | Hour ∈ [13,21) |
+| `regime_score` | float ∈ {−1,0,1} | Regime numeric score: TRENDING_UP=1, TRENDING_DOWN=−1, else 0 |
 
----
+## Implementation
 
-## Context Features
-
-```
-multi-timeframe trend alignment
-volatility regime classification
-session timing (Asia / London / NY)
-trend maturity stage
-```
-
-Optional:
-
-local regime detection via **Ollama**
+Features computed in `PatternDetector.extract_features()` and `FeatureEngine.extract_context_features()`.
 
 ---
 
-# Market Regime Awareness
+# Market Regime Detection & Filtering
 
-Strategy performs best in:
+Real-time regime classification determines whether the strategy participates or stays in cash.
+
+## Regime Types
+
+| Regime | Detection Method | Characteristics | Action |
+| ------ | ---------------- | --------------- | ------ |
+| TRENDING_UP | EMA slope + ATR volatility + EMA cross alignment | Positive slope, low volatility expansion, EMA bullish cross | **Trade** |
+| TRENDING_DOWN | EMA slope + EMA bearish cross | Negative slope, expanding range, EMA bearish cross | Avoid (only long) |
+| RANGING | Low trend strength, high compression | Price range-bound, low ATR expansion | **Avoid** |
+| VOLATILE | ATR > 2× its 10-bar moving average | News spikes, erratic swings | **Avoid** |
+| UNKNOWN | Insufficient data | Cold start or sparse history | **Avoid** |
+
+## Detection Methods
+
+**Primary:** `MarketRegimeDetector` (volatility + trend-strength based)
+**Optional:** `LLMRegimeDetector` via local Ollama — provides LLM-based classification when enabled in `config.ini`.
+
+Both are queried via `PatternDetector.get_regime()`; LLM overrides if available, otherwise falls back to volatility-based detector.
+
+## Integration
+
+All `BASE_BREAK` and `WEDGE_POP` entries are gated by regime:
 
 ```
-trend environments
-momentum expansion cycles
-relative strength leaders
-```
-
-Avoids:
-
-```
-sideways compression markets
-low-volume environments
-news-driven volatility spikes
+if regime ∈ {RANGING, VOLATILE, UNKNOWN}:
+    skip trade
 ```
 
 ---
@@ -440,17 +435,19 @@ news-driven volatility spikes
 Execution pipeline:
 
 ```
-Detect signal
-→ Extract features
-→ Compute probability
-→ Validate trade
-→ Calculate position size
-→ Execute order
-→ Manage trailing stop
-→ Monitor exits
-→ Log trade result
-→ Retrain model
+1  SCAN          ← pattern detection (Base 'n Break, Wedge Pop, Wedge Drop)
+2  EXTRACT       ← 12-feature vector (structure + context)
+3  REGIME CHECK  ← skip if regime ∈ {RANGING, VOLATILE, UNKNOWN}
+4  PROBABILITY   ← P(win) = model.predict_proba(features)
+5  VALIDATE      ← P(win) > threshold ?
+6  POSITION SIZING ← risk = base_risk × continuous_risk_multiplier(confidence)
+7  EXECUTE       ← market order + initial stop
+8  TRAILING      ← stop = price − (TRAIL_ATR_MULT × ATR); never moves down
+9  EXIT          ← Exhaustion Extension or EMA Crossback
+10 LOG + RETRAIN ← append trade outcome; retrain after ≥10 trades
 ```
+
+**Context-only (`WEDGE_DROP`):** Logged but no entry generated.
 
 ---
 
@@ -522,27 +519,33 @@ model retraining required
 
 ---
 
-# Optimization Targets (AI-Controlled)
+# Parameter Optimization (RL-Inspired Hybrid Tuner)
 
-Parameters dynamically tuned:
+An optional offline `ParameterOptimizer` performs random-search backtest sweeps to find robust hyperparameters.
+
+## Tunable Parameters
+
+- `EMA_FAST`, `EMA_SLOW` — trend baseline periods
+- `EXHAUSTION_ATR_MULT` — exhaustion distance threshold (default 3.0)
+- `BASE_ATR_RATIO` — maximum base consolidation width as ATR fraction (default 0.5)
+- `VOLUME_SURGE_MULT` — breakout volume multiplier (default 1.5)
+- `TRAIL_ATR_MULT` — trailing stop ATR multiplier (default 1.5)
+- `PROBABILITY_THRESHOLD` — AI filter threshold (default 0.65)
+
+`BASE_MIN_BARS` and `BASE_MAX_BARS` remain fixed at 3–15.
+
+## Objective Function
 
 ```
-EMA_FAST
-EMA_SLOW
-ATR multipliers
-volume thresholds
-probability threshold
-trailing stop multiplier
-base detection length
+score = 0.4 × profit_factor
+      + 0.4 × sharpe_ratio
+      + 0.2 × win_rate
+      − 10 × max(0, max_drawdown − 0.15)
 ```
 
-Objective:
+**Usage:** `python aitradingbot.py optimize` runs N iterations and prints the best parameter set.
 
-```
-maximize Sharpe ratio
-maximize expectancy
-stabilize drawdown
-```
+**Note:** This is a **batch random search** tuner, not online RL. True online RL/bandit-based parameter adjustment is a future enhancement (see Future Enhancements).
 
 ---
 
@@ -598,3 +601,34 @@ volatility awareness
 adaptive sizing
 AI filtering
 ```
+
+---
+
+# Operational Reliability
+
+**Automatic reconnection:** On cTrader Open API disconnect, `LiveExecutor._on_disconnected()` schedules `_reconnect()` after 10 seconds via `reactor.callLater`. `_reconnect()` creates a fresh `Client` instance and re-registers all callbacks, then restarts the service. Twisted reactor remains running.
+
+**Graceful degradation:** Missing optional dependencies (`sklearn`, `ctrader-open-api`) trigger fallback modes (default thresholds, simulation mode) rather than hard failures.
+
+**Modular design:** Strategy core (`src/core/`) is decoupled from execution (`src/execution/`), enabling isolated unit testing and clean separation of concerns.
+
+---
+
+# Implementation Reference
+
+| Module | File | Responsibility |
+|--------|------|----------------|
+| Bar/Signal types | `src/core/types.py` | Domain dataclasses & enums |
+| Indicators | `src/core/indicators.py` | EMA, ATR, volume average |
+| Pattern detector | `src/core/patterns.py` | Base 'n Break, Wedge Pop, Wedge Drop, exhaust/cross exits |
+| Context features | `src/core/features.py` | MTF alignment, sessions, trend maturity |
+| Regime detector | `src/core/regime.py` | Volatility-based + LLM overlay (Ollama/LightLLM) |
+| AI filter | `src/core/ai_filter.py` | ML classifier, confidence→risk mapping |
+| Risk manager | `src/core/risk.py` | Position size, trailing stop |
+| Backtest runner | `src/execution/backtest_executor.py` | DataFrame-driven simulation engine |
+| Live executor | `src/execution/live_executor.py` | cTrader Open API client with auto-reconnect |
+| Orchestrator | `src/bot.py` | TradingBot — wires all components |
+| Entry point | `main.py` | CLI: `python main.py` (backtest) or `python main.py live` |
+| Legacy monolith | `aitradingbot.py` | Deprecated — use `main.py` + modular architecture |
+
+**LightLLM integration** — `src/core/lightllm_regime.py`: optional fast LLM backend (GPU-accelerated). Configure via `config.ini` (`backend = lightllm`, `lightllm_model_path = …`).

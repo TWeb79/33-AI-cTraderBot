@@ -821,6 +821,21 @@ class AITradingBot:
         self.feature_history: List[dict] = []
         self.outcome_history: List[int] = []
 
+    def _reconnect(self):
+        self.log.info("Reconnecting to cTrader Open API ...")
+
+        self.client = Client(
+            EndPoints.PROTOBUF_LIVE_HOST,
+            EndPoints.PROTOBUF_PORT,
+            TcpProtocol,
+        )
+
+        self.client.setConnectedCallback(self._on_connected)
+        self.client.setDisconnectedCallback(self._on_disconnected)
+        self.client.setMessageReceivedCallback(self._on_message)
+
+        self.client.startService()
+
     def start_live(self):
         if not LIVE_MODE:
             self.log.error("ctrader-open-api not installed. Cannot start live mode.")
@@ -836,8 +851,9 @@ class AITradingBot:
         self.client.setDisconnectedCallback(self._on_disconnected)
         self.client.setMessageReceivedCallback(self._on_message)
         self.client.startService()
-        reactor.run()
-
+        if not reactor.running:
+            reactor.run()
+            
     def _on_connected(self, client):
         self.log.info("Connected. Authenticating ...")
         request = ProtoOAApplicationAuthReq()
@@ -848,7 +864,7 @@ class AITradingBot:
 
     def _on_disconnected(self, client, reason):
         self.log.warning(f"Disconnected: {reason}. Reconnecting in 10s ...")
-        reactor.callLater(10, self.start_live)
+        reactor.callLater(10, self._reconnect)
 
     def _on_message(self, client, message):
         msg_type = Protobuf.extract(message)
