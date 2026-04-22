@@ -8,3 +8,5 @@ service-identity>=21.0
 lightllm>=0.1.0  # faster local inference (GPU recommended)
 ollama>=0.1.0    # easier setup, CPU OK
 pytest>=7.0.0    # testing
+matplotlib>=3.6.0  # plotting for analysis artifacts
+yfinance>=0.2.18   # historic data fallback from Yahoo Finance

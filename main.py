@@ -5,6 +5,9 @@ Entry point for backtest and live trading.
 import sys
 import logging
 import pandas as pd
+import glob
+import os
+import io
 
 from src.bot import TradingBot
 from src.core.indicators import Indicators
@@ -102,9 +105,123 @@ def run_backtest(df: pd.DataFrame, bot: TradingBot) -> pd.DataFrame:
         risk_mgr=bot.risk_mgr,
         initial_balance=bot.balance,
     )
-    # Wire strategy loop
-    executor.on_bar = bot.on_bar  # type: ignore
+    executor.subscribe(bot.on_bar)
     return executor.run()
+
+
+def load_historic_data(symbol: str, timeframe: str, data_dir: str = "data") -> pd.DataFrame:
+    """Load historic data for a symbol/timeframe from the data directory.
+
+    Supports JSON, gzipped JSON, CSV. Matches files like:
+      data/US500_H1.json, data/US500_H1_2024.json.gz, data/US500_H1.csv
+    Returns a DataFrame with columns: time, open, high, low, close, volume
+    """
+    pattern = os.path.join(data_dir, f"{symbol}_*{timeframe}*.json*")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        # try CSV
+        pattern_csv = os.path.join(data_dir, f"{symbol}_*{timeframe}*.csv*")
+        candidates = glob.glob(pattern_csv)
+
+    if not candidates:
+        # Attempt to fetch from Yahoo Finance as a fallback and save locally
+        print(f"No local historic file found for {symbol} {timeframe}. Attempting to fetch from Yahoo Finance...")
+        try:
+            import yfinance as yf
+
+            # map common symbol name to Yahoo ticker (US500 -> ^GSPC)
+            ticker = "^GSPC" if symbol.upper().startswith("US500") or symbol.upper().startswith("SPX") else symbol
+            interval = "60m" if timeframe.upper() in ("H1", "H") else "1d"
+            # download last 5 years of hourly data
+            yf_df = yf.download(tickers=ticker, period="5y", interval=interval, progress=False)
+            if yf_df.empty:
+                raise RuntimeError("Yahoo returned no data")
+
+            yf_df = yf_df.reset_index()
+            yf_df.rename(columns={"Datetime": "time", "Date": "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True)
+            if "time" not in yf_df.columns and "Date" in yf_df.columns:
+                yf_df["time"] = pd.to_datetime(yf_df["Date"])
+            # Ensure proper columns
+            df = yf_df[[col for col in ["time", "open", "high", "low", "close", "volume"] if col in yf_df.columns]]
+
+            # save to data directory for future runs
+            os.makedirs(data_dir, exist_ok=True)
+            out_path = os.path.join(data_dir, f"{symbol}_{timeframe}.json.gz")
+            df.to_json(out_path, orient="records", date_format="iso", compression="gzip")
+            print(f"Saved fetched historic data to {out_path}")
+            return df
+        except Exception as e:
+            print(f"Failed to fetch from Yahoo Finance: {e}. Falling back to demo data.")
+            # create demo data to match expected format
+            demo = generate_demo_data(n_bars=6000)
+            os.makedirs(data_dir, exist_ok=True)
+            out_path = os.path.join(data_dir, f"{symbol}_{timeframe}_demo.json.gz")
+            demo.to_json(out_path, orient="records", date_format="iso", compression="gzip")
+            print(f"Saved demo historic data to {out_path}")
+            return demo
+
+    path = candidates[0]
+    # Reading depending on extension: handle CSV, JSON array, JSON lines, gzipped
+    if path.endswith('.csv') or '.csv.' in path:
+        df = pd.read_csv(path)
+    else:
+        import gzip
+        import json
+
+        # Peek first non-whitespace character to detect JSON lines vs array
+        first_char = None
+        try:
+            open_func = gzip.open if path.endswith('.gz') else open
+            with open_func(path, 'rt', encoding='utf-8', errors='ignore') as fh:
+                while True:
+                    ch = fh.read(1)
+                    if not ch:
+                        break
+                    if ch.isspace():
+                        continue
+                    first_char = ch
+                    break
+        except Exception:
+            first_char = None
+
+        lines_mode = True if first_char == '{' else False
+
+        try:
+            df = pd.read_json(path, lines=lines_mode, compression='infer')
+        except Exception:
+            # Fallback: manual line-by-line JSON parsing
+            records = []
+            open_func = gzip.open if path.endswith('.gz') else open
+            with open_func(path, 'rt', encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        # try to skip invalid trailing content
+                        continue
+                    records.append(obj)
+            df = pd.DataFrame.from_records(records)
+
+    # normalize columns
+    if 'time' in df.columns:
+        df['time'] = pd.to_datetime(df['time'])
+    elif 'date' in df.columns:
+        df['time'] = pd.to_datetime(df['date'])
+    else:
+        # if time is index
+        df = df.reset_index()
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'])
+
+    # ensure numeric columns exist
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col not in df.columns:
+            df[col] = None
+
+    return df[['time', 'open', 'high', 'low', 'close', 'volume']]
 
 
 def main():
@@ -113,6 +230,14 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Capture a copy of the log output in-memory so we can print the START of the log
+    log_buffer = io.StringIO()
+    buf_handler = logging.StreamHandler(log_buffer)
+    buf_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    buf_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(buf_handler)
 
     mode = "backtest"
     if len(sys.argv) > 1:
@@ -125,14 +250,49 @@ def main():
 
     bot = TradingBot()
 
+    # Default symbol/timeframe for backtests
+    SYMBOL_NAME = "US500"
+    TIMEFRAME = "H1"
+
     if mode == "live":
         print("Starting live trading ...")
         bot.start_live()
     else:
-        print("Running backtest on demo data.\n")
-        df = generate_demo_data(n_bars=6000)
+        print("Running backtest. Trying to load historic data if available...\n")
+        try:
+            df = load_historic_data(SYMBOL_NAME, TIMEFRAME)
+        except Exception as e:
+            print(f"Failed to load historic data: {e}")
+            df = None
+
+        if df is None:
+            print("Historic data not found or failed to load — using demo generator.\n")
+            df = generate_demo_data(n_bars=60)
+
+        # Analyze loaded data to show sample AI confidences / predictions
+        try:
+            analysis = bot.analyze_data(df, sample_examples=5)
+            print(f"Data analysis: signals={analysis['n_signals']} mean_confidence={analysis['mean_confidence']:.3f} mean_pred_price={analysis['mean_pred_price']:.4f}")
+            if analysis['examples']:
+                print("Example signals:\n")
+                for ex in analysis['examples']:
+                    print(f" time={ex['time']} signal={ex['signal']} conf={ex['confidence']:.3f} pred_next={ex['pred_next_price']:.4f}")
+        except Exception as e:
+            print(f"Analysis failed: {e}")
+
         trades = run_backtest(df, bot)
         print("\nBacktest completed. See summary above.")
+
+        # Print the start of the captured log (useful when historic data is large and scroll hides the top)
+        try:
+            buf_contents = log_buffer.getvalue().splitlines()
+            head_lines = 60
+            print("\n--- Log start (first %d lines) ---" % head_lines)
+            for line in buf_contents[:head_lines]:
+                print(line)
+            print("--- End log start ---\n")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

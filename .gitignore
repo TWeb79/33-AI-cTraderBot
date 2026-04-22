@@ -94,3 +94,9 @@ __pycache__/
 
 # Project specific (no binary/artifacts expected in repo)
 # Add additional patterns here if you have build outputs or secret files
+# Data folder (market data, logs)
+data/
+
+# Large example data files
+*.jsonl
+*.ndjson

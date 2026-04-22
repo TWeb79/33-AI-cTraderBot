@@ -3,6 +3,14 @@ Main orchestrator: connects core strategy to execution layer.
 Can run in backtest mode (DataFrame) or live mode (cTrader API).
 """
 import logging
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import datetime
+import csv
+import json
+import os
 from typing import Optional
 import pandas as pd
 import configparser
@@ -287,6 +295,98 @@ class TradingBot:
         # Wire on_bar callback
         executor.on_bar = self.on_bar  # type: ignore
         return executor.run()
+
+    def analyze_data(self, df: pd.DataFrame, sample_examples: int = 5) -> dict:
+        """Quick diagnostic: run detector+feature engine over df and report AI confidences
+
+        Returns summary dict and logs examples.
+        """
+        confidences = []
+        preds = []
+        examples = []
+
+        for _, row in df.iterrows():
+            bar = Bar(
+                time=pd.to_datetime(row.get("time", row.get("date"))),
+                open=float(row.get("open", 0)),
+                high=float(row.get("high", 0)),
+                low=float(row.get("low", 0)),
+                close=float(row.get("close", 0)),
+                volume=float(row.get("volume", 0)),
+            )
+            sig = self.detector.push(bar)
+            if sig in (Signal.BASE_BREAK, Signal.WEDGE_POP):
+                feats = self.detector.extract_features(self.feature_engine)
+                if not feats:
+                    continue
+                conf, _ = self.ai_filter.predict_probability(feats)
+                # Naive predicted next-price (simple heuristic): current + breakout_velocity * atr
+                pred = bar.close + feats.get("breakout_velocity", 0) * feats.get("atr", 0)
+                confidences.append(conf)
+                preds.append(pred)
+                if len(examples) < sample_examples:
+                    examples.append({
+                        "time": bar.time,
+                        "signal": sig.value,
+                        "confidence": conf,
+                        "pred_next_price": pred,
+                        "features": feats,
+                    })
+
+        # Prepare summary and save confidence/risk table + histogram for diagnostics
+        risks = [self.RISK_PERCENT * self.ai_filter.get_confidence_risk(c) for c in confidences]
+
+        # Save results CSV and histogram
+        try:
+            os.makedirs('data', exist_ok=True)
+            ts = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
+            out_csv = os.path.join('data', f'analysis_confidences_{ts}.csv')
+            with open(out_csv, 'w', newline='', encoding='utf-8') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['time', 'signal', 'confidence', 'risk_pct', 'pred_next_price'])
+                for i in range(len(confidences)):
+                    t = examples[i]['time'] if i < len(examples) else ''
+                    sig = examples[i]['signal'] if i < len(examples) else ''
+                    pred = preds[i] if i < len(preds) else ''
+                    writer.writerow([t, sig, f"{confidences[i]:.6f}", f"{risks[i]:.6f}", f"{pred}"])
+
+            # plot histograms
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            axes[0].hist(confidences, bins=30, color='C0', alpha=0.8)
+            axes[0].set_title('AI Confidence Distribution')
+            axes[0].set_xlabel('Confidence')
+            axes[0].set_ylabel('Count')
+
+            axes[1].hist(risks, bins=30, color='C1', alpha=0.8)
+            axes[1].set_title('Derived Risk % Distribution')
+            axes[1].set_xlabel('Risk %')
+            axes[1].set_ylabel('Count')
+
+            out_png = os.path.join('data', f'analysis_confidence_hist_{ts}.png')
+            fig.tight_layout()
+            fig.savefig(out_png)
+            plt.close(fig)
+            self.log.info(f"[ANALYSIS] Saved confidence CSV -> {out_csv} and histogram -> {out_png}")
+        except Exception as e:
+            self.log.warning(f"[ANALYSIS] Failed to save analysis artifacts: {e}")
+
+        summary = {
+            "n_signals": len(confidences),
+            "mean_confidence": float(np.mean(confidences)) if confidences else 0.0,
+            "min_confidence": float(np.min(confidences)) if confidences else 0.0,
+            "max_confidence": float(np.max(confidences)) if confidences else 0.0,
+            "mean_pred_price": float(np.mean(preds)) if preds else 0.0,
+            "examples": examples,
+        }
+
+        self.log.info(f"[ANALYSIS] Signals found={summary['n_signals']} mean_conf={summary['mean_confidence']:.3f} mean_pred_price={summary['mean_pred_price']:.4f}")
+        for ex in examples:
+            self.log.info(f"[ANALYSIS EX] time={ex['time']} sig={ex['signal']} conf={ex['confidence']:.3f} pred_next={ex['pred_next_price']:.4f}")
+
+        if summary['n_signals'] == 0:
+            self.log.info("[ANALYSIS] No valid breakout signals detected in provided dataset. Consider adding more historical data or checking data quality.")
+
+        return summary
 
     def start_live(self):
         if not self._check_live_deps():
